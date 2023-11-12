@@ -2,7 +2,7 @@ use rand::Rng;
 use std::cmp;
 use tcod::map::{FovAlgorithm, Map as FovMap};
 
-use tcod::colors::*;
+use tcod::colors::{self, *};
 use tcod::console::*;
 use tcod::input::Key;
 use tcod::input::KeyCode::*;
@@ -40,6 +40,10 @@ const MAX_ROOMS: i32 = 30;
 const FOV_ALGO: FovAlgorithm = FovAlgorithm::Basic; // 默认FOV算法
 const FOV_LIGHT_WALLS: bool = true;
 const TORCH_RADIUS: i32 = 10;
+// 怪物数量
+const MAX_ROOM_MONSTERS: i32 = 3;
+// 玩家是第一位
+const PLAYER: usize = 0;
 
 type Map = Vec<Vec<Tile>>;
 
@@ -62,6 +66,9 @@ struct Object {
     y: i32,
     char: char,
     color: Color,
+    name: String,
+    blocks: bool,
+    alive: bool,
 }
 
 /// 地图的瓦片和它的属性
@@ -86,8 +93,16 @@ struct Rect {
 
 impl Object {
     /// 快捷方法创建一个对象
-    pub fn new(x: i32, y: i32, char: char, color: Color) -> Self {
-        Self { x, y, char, color }
+    pub fn new(x: i32, y: i32, char: char, name: &str, color: Color, blocks: bool) -> Self {
+        Self {
+            x,
+            y,
+            char,
+            color,
+            name: name.into(),
+            blocks,
+            alive: false,
+        }
     }
 
     /// 移动给定的值
@@ -104,6 +119,17 @@ impl Object {
     pub fn draw(&self, con: &mut dyn Console) {
         con.set_default_foreground(self.color);
         con.put_char(self.x, self.y, self.char, BackgroundFlag::None);
+    }
+
+    /// 获取对象位置
+    pub fn pos(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
+
+    /// 设置对象位置
+    pub fn set_pos(&mut self, x: i32, y: i32) {
+        self.x = x;
+        self.y = y;
     }
 }
 
@@ -168,11 +194,10 @@ fn main() {
 
     tcod::system::set_fps(LIMIT_FPS);
 
-    let player = Object::new(0, 0, '@', WHITE);
-    let npc = Object::new(SCREEN_WIDTH / 2 - 5, SCREEN_HEIGHT / 2, '@', YELLOW);
-    let mut objects: [Object; 2] = [player, npc];
+    let mut player = Object::new(0, 0, '@', "player", WHITE, true);
+    let mut objects: Vec<Object> = vec![player];
     let mut game = Game {
-        map: make_map(&mut objects[0]),
+        map: make_map(&mut objects),
     };
     let mut previous_player_position = (-1, -1);
 
@@ -192,11 +217,11 @@ fn main() {
     while !tcod.root.window_closed() {
         // 清除离屏的上一次渲染
         tcod.con.clear();
-        let fov_recompute = previous_player_position != (objects[0].x, objects[0].y);
+        let fov_recompute = previous_player_position != (objects[PLAYER].pos());
         render_all(&mut tcod, &mut game, &objects, fov_recompute);
         tcod.root.flush();
 
-        let player = &mut objects[0];
+        let player = &mut objects[PLAYER];
         previous_player_position = (player.x, player.y);
         let exit = handle_keys(&mut tcod, &game, player);
 
@@ -208,7 +233,7 @@ fn main() {
 
 fn render_all(tcod: &mut Tcod, game: &mut Game, objects: &[Object], fov_recompute: bool) {
     if fov_recompute {
-        let player = &objects[0];
+        let player = &objects[PLAYER];
         tcod.fov
             .compute_fov(player.x, player.y, TORCH_RADIUS, FOV_LIGHT_WALLS, FOV_ALGO);
     }
@@ -275,18 +300,18 @@ fn handle_keys(tcod: &mut Tcod, game: &Game, player: &mut Object) -> bool {
     false
 }
 
-fn make_map(player: &mut Object) -> Map {
+fn make_map(objects: &mut Vec<Object>) -> Map {
     let mut map = vec![vec![Tile::wall(); MAP_HEIGHT as usize]; MAP_WIDTH as usize];
 
     let mut rooms = vec![];
 
     for _ in 0..MAX_ROOMS {
         // 随机房间宽高
-        let w = rand::thread_rng().gen_range((ROOM_MIN_SIZE..ROOM_MAX_SIZE + 1));
-        let h = rand::thread_rng().gen_range((ROOM_MIN_SIZE..ROOM_MAX_SIZE + 1));
+        let w = rand::thread_rng().gen_range(ROOM_MIN_SIZE..ROOM_MAX_SIZE + 1);
+        let h = rand::thread_rng().gen_range(ROOM_MIN_SIZE..ROOM_MAX_SIZE + 1);
         // 随机房间位置，保证在地图内
-        let x = rand::thread_rng().gen_range((0..MAP_WIDTH - w));
-        let y = rand::thread_rng().gen_range((0..MAP_HEIGHT - h));
+        let x = rand::thread_rng().gen_range(0..MAP_WIDTH - w);
+        let y = rand::thread_rng().gen_range(0..MAP_HEIGHT - h);
 
         let new_room = Rect::new(x, y, w, h);
 
@@ -298,13 +323,14 @@ fn make_map(player: &mut Object) -> Map {
         if !failed {
             // 有效房间，绘制在地图上
             create_room(new_room, &mut map);
+            // 创建怪物
+            place_objects(new_room, objects);
 
             let (new_x, new_y) = new_room.center();
 
             if rooms.is_empty() {
                 // 玩家从第一个房间开始
-                player.x = new_x;
-                player.y = new_y;
+                objects[PLAYER].set_pos(new_x, new_y);
             } else {
                 // 我们可以从一个水平隧道开始，到达与新房间相同的高度，然后与一个垂直隧道相连，或者我们可以做相反的事情:从一个垂直隧道开始，以一个水平隧道结束。
 
@@ -326,6 +352,22 @@ fn make_map(player: &mut Object) -> Map {
     }
 
     map
+}
+
+fn place_objects(room: Rect, objects: &mut Vec<Object>) {
+    let num_monsters = rand::thread_rng().gen_range(0..MAX_ROOM_MONSTERS + 1);
+
+    for _ in 0..num_monsters {
+        let x = rand::thread_rng().gen_range(room.x1 + 1..room.x2);
+        let y = rand::thread_rng().gen_range(room.y1..room.y2);
+        let monster = if rand::random::<f32>() < 0.8 {
+            // 80%的几率是兽人
+            Object::new(x, y, 'o', "orc", DESATURATED_GREEN, true)
+        } else {
+            Object::new(x, y, 'T', "troll", DARKER_GREEN, true)
+        };
+        objects.push(monster);
+    }
 }
 
 /// 将一个矩形放置在图上，并确保其地图快是空的
